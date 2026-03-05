@@ -1,659 +1,569 @@
 import glob
 import os
+import warnings
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 import numpy as np
 import pandas as pd
 import seaborn as sns
 
-
-CHARTS_DIR = "charts"
-
-
-def load_data():
-    """Load retailers and orders CSVs using glob."""
-    retailers_paths = glob.glob("psa_exercise_retailers*.csv")
-    orders_paths = glob.glob("psa_exercise_orders*.csv")
-
-    if not retailers_paths:
-        raise FileNotFoundError("No psa_exercise_retailers*.csv files found.")
-    if not orders_paths:
-        raise FileNotFoundError("No psa_exercise_orders*.csv files found.")
-
-    retailers_path = retailers_paths[0]
-    orders_path = orders_paths[0]
-
-    print(f"Using retailers file: {retailers_path}")
-    print(f"Using orders file: {orders_path}")
-
-    retailers = pd.read_csv(
-        retailers_path,
-        parse_dates=[
-            "FIRST_APP_SESSION_AT",
-            "FIRST_DESKTOP_SESSION_AT",
-            "FIRST_MOBILE_WEB_SESSION_AT",
-            "FIRST_CONFIRMED_ORDER_PLACED_AT",
-        ],
-    )
-    orders = pd.read_csv(
-        orders_path,
-        parse_dates=["ORDER_CREATED"],
-    )
-
-    return retailers, orders
-
-
-def initial_exploration(retailers: pd.DataFrame, orders: pd.DataFrame) -> None:
-    """Print basic info, dtypes, nulls, and some categorical value_counts."""
-    print("\n=== Retailers shape, columns, dtypes ===")
-    print(retailers.shape)
-    print(retailers.columns)
-    print(retailers.dtypes)
-
-    print("\n=== Retailers null counts ===")
-    print(retailers.isna().sum())
-
-    print("\n=== Orders shape, columns, dtypes ===")
-    print(orders.shape)
-    print(orders.columns)
-    print(orders.dtypes)
-
-    print("\n=== Orders null counts ===")
-    print(orders.isna().sum())
-
-    # Categorical columns in retailers
-    cat_cols = retailers.select_dtypes(include=["object", "bool"]).columns
-    print("\n=== Retailers categorical value_counts (top 20) ===")
-    for col in cat_cols:
-        print(f"\nValue counts for retailers[{col}]:")
-        print(retailers[col].value_counts(dropna=False).head(20))
-
-    # Confirm ORDER_ID is not unique by showing a sample multi-row order
-    print("\n=== Sample multi-row ORDER_ID from orders ===")
-    order_counts = orders["ORDER_ID"].value_counts()
-    multi_order_ids = order_counts[order_counts > 1]
-    if not multi_order_ids.empty:
-        sample_id = multi_order_ids.index[0]
-        print(f"Sample ORDER_ID with multiple rows: {sample_id}")
-        print(orders[orders["ORDER_ID"] == sample_id].head())
-    else:
-        print("All ORDER_IDs appear to be unique (unexpected for this dataset).")
-
-
-def build_cohort_matrices(
-    retailers: pd.DataFrame, orders: pd.DataFrame
-):
-    """
-    Prepare cohort-level monthly GMV matrices and per-retailer metrics.
-
-    Returns:
-        orders_with_month: orders joined with retailers and month_index
-        gmv_pivot: RETAILER_ID x month_index matrix of total GMV
-        active_matrix: RETAILER_ID x month_index matrix of 1/0 activity
-        retailers_metrics: retailers with attached GMV/retention features
-        ndr_series: NDR by month_index
-        max_month: maximum month_index observed
-    """
-    # Join orders to cohort retailers to ensure alignment
-    retailers_core_cols = [
-        "RETAILER_ID",
-        "FIRST_CONFIRMED_ORDER_PLACED_AT",
-        "FLAG_APP_INSTALLED",
-        "PAYMENT_TERM",
-        "ANNUAL_SALES_BUCKET",
-        "RETAILER_BUSINESS_TYPE",
-        "RETAILER_BUCKETED_CHANNEL",
-        "RETAILER_STORE_TYPE",
-    ]
-    orders_joined = orders.merge(
-        retailers[retailers_core_cols],
-        on="RETAILER_ID",
-        how="inner",
-        suffixes=("", "_RETAILER"),
-    )
-
-    # Month buckets
-    orders_joined["order_month"] = orders_joined["ORDER_CREATED"].dt.to_period("M")
-    orders_joined["first_month"] = (
-        orders_joined["FIRST_CONFIRMED_ORDER_PLACED_AT"].dt.to_period("M")
-    )
-    orders_joined["month_index"] = (
-        orders_joined["order_month"] - orders_joined["first_month"]
-    ).astype(int)
-
-    # Keep only months >= 0
-    orders_joined = orders_joined[orders_joined["month_index"] >= 0].copy()
-
-    # Monthly GMV per retailer
-    gmv = (
-        orders_joined.groupby(["RETAILER_ID", "month_index"])["TOTAL_GMV"]
-        .sum()
-        .reset_index()
-    )
-
-    gmv_pivot = (
-        gmv.pivot(index="RETAILER_ID", columns="month_index", values="TOTAL_GMV")
-        .fillna(0.0)
-    )
-    gmv_pivot = gmv_pivot.sort_index(axis=1)
-    max_month = int(gmv_pivot.columns.max())
-    all_months = list(range(0, max_month + 1))
-    gmv_pivot = gmv_pivot.reindex(columns=all_months, fill_value=0.0)
-
-    gmv0 = gmv_pivot[0]
-    valid_gmv0 = gmv0 > 0
-    gmv_pivot_valid = gmv_pivot.loc[valid_gmv0]
-    gmv0_valid = gmv0.loc[valid_gmv0]
-
-    # NDR by month: average across retailers of (GMV_t / GMV_0)
-    ndr_matrix = gmv_pivot_valid.div(gmv0_valid, axis=0)
-    ndr_series = ndr_matrix.mean(axis=0)
-
-    # Activity and retention metrics
-    active_matrix = (gmv_pivot > 0).astype(int)
-    total_gmv = gmv_pivot.sum(axis=1)
-    months_active = active_matrix.sum(axis=1)
-
-    if max_month >= 6:
-        has_6_plus = (gmv_pivot.loc[:, 6:] > 0).any(axis=1)
-    else:
-        has_6_plus = pd.Series(False, index=gmv_pivot.index)
-
-    if max_month >= 12:
-        has_12_plus = (gmv_pivot.loc[:, 12:] > 0).any(axis=1)
-    else:
-        has_12_plus = pd.Series(False, index=gmv_pivot.index)
-
-    early_active_count = (gmv_pivot.loc[:, 0:2] > 0).sum(axis=1)
-
-    # First-month brand diversity
-    month0 = orders_joined[orders_joined["month_index"] == 0]
-    brand_diversity = (
-        month0.groupby("RETAILER_ID")["BRAND_ID"].nunique().astype(float)
-    )
-
-    metrics = pd.DataFrame(
-        {
-            "gmv0": gmv0,
-            "total_gmv": total_gmv,
-            "months_active": months_active,
-            "has_6_plus": has_6_plus,
-            "has_12_plus": has_12_plus,
-            "early_active_count_0_2": early_active_count,
-            "brand_diversity": brand_diversity,
-        }
-    )
-
-    retailers_metrics = (
-        retailers.set_index("RETAILER_ID").join(metrics, how="left")
-    )
-
-    # App timing fields (days between first order and first app session)
-    retailers_metrics["days_to_app"] = (
-        retailers_metrics["FIRST_APP_SESSION_AT"]
-        - retailers_metrics["FIRST_CONFIRMED_ORDER_PLACED_AT"]
-    ).dt.days
-
-    def bucket_app_timing(days):
-        if pd.isna(days):
-            return "Never installed"
-        if days < 0:
-            return "Before first order"
-        if days <= 30:
-            return "Within 30 days"
-        if days <= 180:
-            return "30-180 days"
-        return "180+ days"
-
-    retailers_metrics["app_timing_bucket"] = retailers_metrics["days_to_app"].apply(
-        bucket_app_timing
-    )
-
-    # Annual sales segment: unknown vs known
-    retailers_metrics["ANNUAL_SALES_SEGMENT"] = np.where(
-        retailers_metrics["ANNUAL_SALES_BUCKET"] == "Unknown",
-        "Unknown",
-        "Known",
-    )
-
-    return orders_joined, gmv_pivot, active_matrix, retailers_metrics, ndr_series, max_month
-
-
-def print_ndr(ndr_series: pd.Series, max_month: int) -> None:
-    """Print NDR for months 0–17 (or up to max_month if smaller)."""
-    print("\n=== NDR by month ===")
-    for t in range(0, min(18, max_month + 1)):
-        if t in ndr_series.index:
-            val = ndr_series.loc[t]
-            print(f"Month {t}: {val * 100:.1f}%")
-        else:
-            print(f"Month {t}: (no data)")
-
-
-def analyze_brand_diversity(retailers_metrics: pd.DataFrame):
-    """Hypothesis 1: first-month brand diversity predicts retention."""
-    df = retailers_metrics.copy()
-    df = df[df["gmv0"] > 0].copy()
-    df["brand_diversity"] = df["brand_diversity"].fillna(0).astype(int)
-
-    def bucket_brand_diversity(n: int) -> str:
-        if n <= 1:
-            return "1"
-        if n == 2:
-            return "2"
-        if 3 <= n <= 5:
-            return "3-5"
-        return "6+"
-
-    df["brand_bucket"] = df["brand_diversity"].apply(bucket_brand_diversity)
-
-    summary = (
-        df.groupby("brand_bucket")
-        .agg(
-            retailers_count=("brand_bucket", "size"),
-            retention_6m=("has_6_plus", "mean"),
-            retention_12m=("has_12_plus", "mean"),
-        )
-        .reset_index()
-    )
-    summary["retention_6m_pct"] = summary["retention_6m"] * 100
-    summary["retention_12m_pct"] = summary["retention_12m"] * 100
-
-    print("\n=== Hypothesis 1: Brand diversity vs retention ===")
-    print(summary)
-
-    # Bar chart: 6- and 12-month retention by brand diversity bucket
-    plot_df = summary.melt(
-        id_vars="brand_bucket",
-        value_vars=["retention_6m_pct", "retention_12m_pct"],
-        var_name="metric",
-        value_name="retention_pct",
-    )
-    metric_map = {
-        "retention_6m_pct": "6-month retention",
-        "retention_12m_pct": "12-month retention",
-    }
-    plot_df["metric"] = plot_df["metric"].map(metric_map)
-
-    plt.figure(figsize=(8, 5))
-    sns.barplot(
-        data=plot_df,
-        x="brand_bucket",
-        y="retention_pct",
-        hue="metric",
-    )
-    plt.xlabel("Unique brands in month 0")
-    plt.ylabel("Retention (%)")
-    plt.title("Retention by first-month brand diversity")
-    plt.tight_layout()
-    plt.savefig(os.path.join(CHARTS_DIR, "h1_brand_diversity.png"))
-    plt.close()
-
-    return summary
-
-
-def analyze_early_repeat(retailers_metrics: pd.DataFrame):
-    """Hypothesis 2: early repeat purchasing predicts retention."""
-    df = retailers_metrics.copy()
-    df = df[df["gmv0"] > 0].copy()
-
-    # Clip at 3+ so we get 0–3 active months in first 3
-    df["early_active_group"] = df["early_active_count_0_2"].fillna(0).astype(int)
-    df["early_active_group"] = df["early_active_group"].clip(upper=3)
-
-    # Focus on 1-of-3, 2-of-3, 3-of-3 as requested
-    df_interest = df[df["early_active_group"].isin([1, 2, 3])].copy()
-
-    summary = (
-        df_interest.groupby("early_active_group")
-        .agg(
-            retailers_count=("early_active_group", "size"),
-            retention_12m=("has_12_plus", "mean"),
-        )
-        .reset_index()
-    )
-    summary["retention_12m_pct"] = summary["retention_12m"] * 100
-
-    print("\n=== Hypothesis 2: Early repeat purchasing vs 12-month retention ===")
-    print(summary)
-
-    plt.figure(figsize=(7, 5))
-    sns.barplot(
-        data=summary,
-        x="early_active_group",
-        y="retention_12m_pct",
-        color="#4c72b0",
-    )
-    plt.xlabel("Active months in first 3 (of months 0–2)")
-    plt.ylabel("12-month retention (%)")
-    plt.title("12-month retention vs early repeat activity")
-    plt.tight_layout()
-    plt.savefig(os.path.join(CHARTS_DIR, "h2_early_repeat.png"))
-    plt.close()
-
-    return summary
-
-
-def analyze_app_effects(retailers_metrics: pd.DataFrame):
-    """App install vs retention and timing buckets."""
-    df = retailers_metrics.copy()
-    df = df[df["gmv0"] > 0].copy()
-
-    print("\n=== App install flag vs 12-month retention ===")
-    app_flag_summary = (
-        df.groupby("FLAG_APP_INSTALLED")["has_12_plus"].agg(["mean", "count"])
-    )
-    app_flag_summary["retention_12m_pct"] = app_flag_summary["mean"] * 100
-    print(app_flag_summary)
-
-    # Timing buckets among those who installed
-    installed = df[~df["FIRST_APP_SESSION_AT"].isna()].copy()
-    timing_pct = (
-        installed["app_timing_bucket"].value_counts(normalize=True) * 100
-    ).rename("pct_of_installed")
-
-    print(
-        "\n=== App install timing among installed (share by timing bucket) ==="
-    )
-    print(timing_pct)
-
-    # 12-month retention by timing bucket (including Never installed)
-    timing_retention = (
-        df.groupby("app_timing_bucket")["has_12_plus"]
-        .agg(["mean", "count"])
-        .reset_index()
-    )
-    timing_retention["retention_12m_pct"] = timing_retention["mean"] * 100
-
-    print("\n=== 12-month retention by app timing bucket ===")
-    print(timing_retention)
-
-    return app_flag_summary, timing_pct, timing_retention
-
-
-def compute_single_month_churn(
-    active_matrix: pd.DataFrame,
-    retailer_mask: pd.Series,
-    max_month: int,
-) -> float:
-    """Compute average single-month churn rate for a segment."""
-    idx = active_matrix.index[retailer_mask]
-    if idx.empty or max_month < 1:
-        return float("nan")
-
-    active_sub = active_matrix.loc[idx]
-    monthly_rates = []
-
-    for m in range(0, max_month):
-        current_active = active_sub[m] == 1
-        denom = int(current_active.sum())
-        if denom == 0:
-            continue
-        next_active = active_sub[m + 1] == 1
-        churned = current_active & (~next_active)
-        rate = churned.sum() / denom
-        monthly_rates.append(rate)
-
-    if not monthly_rates:
-        return float("nan")
-    return float(np.mean(monthly_rates))
-
-
-def analyze_payment_terms(
-    retailers_metrics: pd.DataFrame,
-    active_matrix: pd.DataFrame,
-    max_month: int,
-):
-    """Payment term analysis and app x term cross-tab."""
-    df = retailers_metrics.copy()
-    df = df[df["gmv0"] > 0].copy()
-
-    groups = []
-    for term, sub in df.groupby("PAYMENT_TERM"):
-        mask = df.index.isin(sub.index)
-        churn = compute_single_month_churn(active_matrix, mask, max_month)
-        groups.append(
-            {
-                "PAYMENT_TERM": term,
-                "retailers_count": len(sub),
-                "avg_lifetime_gmv": sub["total_gmv"].mean(),
-                "avg_months_active": sub["months_active"].mean(),
-                "single_month_churn": churn,
-                "retention_6m": sub["has_6_plus"].mean(),
-            }
-        )
-
-    summary = pd.DataFrame(groups)
-    summary["retention_6m_pct"] = summary["retention_6m"] * 100
-    summary["single_month_churn_pct"] = summary["single_month_churn"] * 100
-
-    print("\n=== Payment terms: retention and churn metrics ===")
-    print(summary)
-
-    # Cross-tab: 6-month retention by PAYMENT_TERM x FLAG_APP_INSTALLED
-    crosstab = (
-        df.groupby(["PAYMENT_TERM", "FLAG_APP_INSTALLED"])["has_6_plus"]
-        .mean()
-        .reset_index()
-    )
-    crosstab["retention_6m_pct"] = crosstab["has_6_plus"] * 100
-    print(
-        "\n=== 6-month retention by PAYMENT_TERM x FLAG_APP_INSTALLED ==="
-    )
-    print(crosstab)
-
-    # Chart: grouped bar for cross-tab
-    plt.figure(figsize=(8, 5))
-    sns.barplot(
-        data=crosstab,
-        x="PAYMENT_TERM",
-        y="retention_6m_pct",
-        hue="FLAG_APP_INSTALLED",
-    )
-    plt.ylabel("6-month retention (%)")
-    plt.title("6-month retention by payment term and app install")
-    plt.tight_layout()
-    plt.savefig(os.path.join(CHARTS_DIR, "payment_term_app_crosstab.png"))
-    plt.close()
-
-    return summary, crosstab
-
-
-def analyze_unknown_segment(
-    retailers_metrics: pd.DataFrame,
-    active_matrix: pd.DataFrame,
-    max_month: int,
-):
-    """Deep dive on ANNUAL_SALES_BUCKET = 'Unknown' vs known."""
-    df = retailers_metrics.copy()
-    df = df[df["gmv0"] > 0].copy()
-
-    segments = []
-    for seg, sub in df.groupby("ANNUAL_SALES_SEGMENT"):
-        mask = df.index.isin(sub.index)
-        churn = compute_single_month_churn(active_matrix, mask, max_month)
-        segments.append(
-            {
-                "ANNUAL_SALES_SEGMENT": seg,
-                "retailers_count": len(sub),
-                "avg_lifetime_gmv": sub["total_gmv"].mean(),
-                "avg_months_active": sub["months_active"].mean(),
-                "retention_12m": sub["has_12_plus"].mean(),
-                "single_month_churn": churn,
-            }
-        )
-
-    summary = pd.DataFrame(segments)
-    summary["retention_12m_pct"] = summary["retention_12m"] * 100
-    summary["single_month_churn_pct"] = summary["single_month_churn"] * 100
-
-    print("\n=== Unknown vs known annual sales segments ===")
-    print(summary)
-
-    # Payment term distribution
-    payment_dist = (
-        df.groupby("ANNUAL_SALES_SEGMENT")["PAYMENT_TERM"]
-        .value_counts(normalize=True)
-        .rename("share")
-        .reset_index()
-    )
-    payment_dist["share_pct"] = payment_dist["share"] * 100
-
-    print("\n=== Payment term distribution by annual sales segment ===")
-    print(payment_dist)
-
-    # Business type distribution
-    business_dist = (
-        df.groupby("ANNUAL_SALES_SEGMENT")["RETAILER_BUSINESS_TYPE"]
-        .value_counts(normalize=True)
-        .rename("share")
-        .reset_index()
-    )
-    business_dist["share_pct"] = business_dist["share"] * 100
-
-    print("\n=== Business type distribution by annual sales segment ===")
-    print(business_dist)
-
-    return summary, payment_dist, business_dist
-
-
-def create_summary_visualization(
-    ndr_series: pd.Series,
-    brand_summary: pd.DataFrame,
-    early_summary: pd.DataFrame,
-    app_timing_retention: pd.DataFrame,
-    payment_term_summary: pd.DataFrame,
-    unknown_summary: pd.DataFrame,
-):
-    """Create 2x3 grid summary of key charts."""
-    sns.set(style="whitegrid")
-
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-
-    # 1. NDR over time
-    ax = axes[0, 0]
-    ndr_plot = ndr_series.copy() * 100
-    ax.plot(ndr_plot.index, ndr_plot.values, marker="o")
-    ax.set_xlabel("Month since first order")
-    ax.set_ylabel("NDR (%)")
-    ax.set_title("Net Dollar Retention by month")
-
-    # 2. Brand diversity vs 12m retention
-    ax = axes[0, 1]
-    brand_plot = brand_summary.copy()
-    sns.barplot(
-        data=brand_plot,
-        x="brand_bucket",
-        y="retention_12m_pct",
-        ax=ax,
-        color="#4c72b0",
-    )
-    ax.set_xlabel("Unique brands in month 0")
-    ax.set_ylabel("12-month retention (%)")
-    ax.set_title("Brand diversity vs 12m retention")
-
-    # 3. Early repeat vs 12m retention
-    ax = axes[0, 2]
-    early_plot = early_summary.copy()
-    sns.barplot(
-        data=early_plot,
-        x="early_active_group",
-        y="retention_12m_pct",
-        ax=ax,
-        color="#55a868",
-    )
-    ax.set_xlabel("Active months in first 3")
-    ax.set_ylabel("12-month retention (%)")
-    ax.set_title("Early repeat vs 12m retention")
-
-    # 4. App timing vs 12m retention
-    ax = axes[1, 0]
-    timing_plot = app_timing_retention.copy()
-    sns.barplot(
-        data=timing_plot,
-        x="app_timing_bucket",
-        y="retention_12m_pct",
-        ax=ax,
-        color="#c44e52",
-    )
-    ax.set_xlabel("App timing bucket")
-    ax.set_ylabel("12-month retention (%)")
-    ax.set_title("App timing vs 12m retention")
-    ax.tick_params(axis="x", rotation=30)
-
-    # 5. Payment term vs 6m retention
-    ax = axes[1, 1]
-    pay_plot = payment_term_summary.copy()
-    sns.barplot(
-        data=pay_plot,
-        x="PAYMENT_TERM",
-        y="retention_6m_pct",
-        ax=ax,
-        color="#8172b3",
-    )
-    ax.set_xlabel("Payment term")
-    ax.set_ylabel("6-month retention (%)")
-    ax.set_title("Payment term vs 6m retention")
-
-    # 6. Unknown vs known 12m retention
-    ax = axes[1, 2]
-    unknown_plot = unknown_summary.copy()
-    sns.barplot(
-        data=unknown_plot,
-        x="ANNUAL_SALES_SEGMENT",
-        y="retention_12m_pct",
-        ax=ax,
-        color="#ccb974",
-    )
-    ax.set_xlabel("Annual sales segment")
-    ax.set_ylabel("12-month retention (%)")
-    ax.set_title("Unknown vs known 12m retention")
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(CHARTS_DIR, "summary.png"))
-    plt.close()
-
-
-def main():
-    os.makedirs(CHARTS_DIR, exist_ok=True)
-    sns.set(style="whitegrid")
-
-    retailers, orders = load_data()
-    initial_exploration(retailers, orders)
-
-    (
-        orders_with_month,
-        gmv_pivot,
-        active_matrix,
-        retailers_metrics,
-        ndr_series,
-        max_month,
-    ) = build_cohort_matrices(retailers, orders)
-
-    print_ndr(ndr_series, max_month)
-
-    brand_summary = analyze_brand_diversity(retailers_metrics)
-    early_summary = analyze_early_repeat(retailers_metrics)
-    app_flag_summary, app_timing_pct, app_timing_retention = analyze_app_effects(
-        retailers_metrics
-    )
-    payment_term_summary, payment_crosstab = analyze_payment_terms(
-        retailers_metrics, active_matrix, max_month
-    )
-    unknown_summary, payment_dist, business_dist = analyze_unknown_segment(
-        retailers_metrics, active_matrix, max_month
-    )
-
-    create_summary_visualization(
-        ndr_series,
-        brand_summary,
-        early_summary,
-        app_timing_retention,
-        payment_term_summary,
-        unknown_summary,
-    )
-
-
-if __name__ == "__main__":
-    main()
-
+warnings.filterwarnings("ignore")
+
+os.makedirs("charts", exist_ok=True)
+
+# ─────────────────────────────────────────────
+# SECTION 1 – Load & Explore Data
+# ─────────────────────────────────────────────
+print("=" * 60)
+print("SECTION 1: DATA EXPLORATION")
+print("=" * 60)
+
+retailer_files = glob.glob("/workspace/psa_exercise_retailers*.csv")
+order_files    = glob.glob("/workspace/psa_exercise_orders*.csv")
+
+retailers = pd.read_csv(retailer_files[0], parse_dates=["FIRST_APP_SESSION_AT",
+                                                          "FIRST_DESKTOP_SESSION_AT",
+                                                          "FIRST_MOBILE_WEB_SESSION_AT",
+                                                          "FIRST_CONFIRMED_ORDER_PLACED_AT"])
+orders    = pd.read_csv(order_files[0],    parse_dates=["ORDER_CREATED"])
+
+print(f"\nRetailers — shape: {retailers.shape}")
+print(retailers.dtypes)
+print("\nNull counts:\n", retailers.isnull().sum())
+
+print(f"\nOrders — shape: {orders.shape}")
+print(orders.dtypes)
+print("\nNull counts:\n", orders.isnull().sum())
+
+print("\n--- Retailer categorical value counts ---")
+cat_cols = retailers.select_dtypes(include="object").columns.tolist()
+for col in cat_cols:
+    print(f"\n{col}:\n{retailers[col].value_counts()}")
+
+print("\n--- Confirm ORDER_ID is NOT unique per row ---")
+dupe = orders[orders.duplicated("ORDER_ID", keep=False)].sort_values("ORDER_ID")
+sample_order = dupe["ORDER_ID"].iloc[0]
+print(f"Sample ORDER_ID with multiple rows: {sample_order}")
+print(dupe[dupe["ORDER_ID"] == sample_order])
+
+# ─────────────────────────────────────────────
+# SECTION 2 – NDR Calculation & Validation
+# ─────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("SECTION 2: NDR CALCULATION")
+print("=" * 60)
+
+# Merge to get FIRST_CONFIRMED_ORDER_PLACED_AT on orders
+orders_m = orders.merge(
+    retailers[["RETAILER_ID", "FIRST_CONFIRMED_ORDER_PLACED_AT"]],
+    on="RETAILER_ID", how="left"
+)
+
+# Compute month offset (0-based from cohort entry month)
+orders_m["MONTH_OFFSET"] = (
+    (orders_m["ORDER_CREATED"].dt.year  - orders_m["FIRST_CONFIRMED_ORDER_PLACED_AT"].dt.year) * 12 +
+    (orders_m["ORDER_CREATED"].dt.month - orders_m["FIRST_CONFIRMED_ORDER_PLACED_AT"].dt.month)
+)
+
+# Monthly GMV per retailer
+monthly_gmv = (
+    orders_m.groupby(["RETAILER_ID", "MONTH_OFFSET"])["TOTAL_GMV"]
+    .sum()
+    .reset_index()
+    .rename(columns={"TOTAL_GMV": "GMV"})
+)
+
+# GMV_0 per retailer
+gmv0 = monthly_gmv[monthly_gmv["MONTH_OFFSET"] == 0][["RETAILER_ID", "GMV"]].rename(columns={"GMV": "GMV0"})
+
+# Merge and compute NDR per retailer per month
+monthly_gmv = monthly_gmv.merge(gmv0, on="RETAILER_ID", how="left")
+monthly_gmv["NDR"] = monthly_gmv["GMV"] / monthly_gmv["GMV0"]
+
+# Aggregate cohort NDR: total cohort GMV_t / total cohort GMV_0
+# (This is the standard Net Dollar Retention: cohort's total spend in month t
+#  relative to cohort's total spend in month 0; retailers inactive in month t contribute 0)
+total_gmv0 = gmv0["GMV0"].sum()
+month_range = range(0, 18)
+
+ndr_rows = []
+for t in month_range:
+    cohort_gmv_t = monthly_gmv[monthly_gmv["MONTH_OFFSET"] == t]["GMV"].sum()
+    ndr_rows.append({"MONTH": t, "NDR": cohort_gmv_t / total_gmv0})
+
+ndr_df = pd.DataFrame(ndr_rows)
+print("\nNDR by Month (avg across retailers):")
+print(ndr_df.to_string(index=False))
+
+ref = {0: 1.00, 1: 0.59, 2: 0.54, 3: 0.56, 5: 0.49, 12: 0.75}
+print("\nValidation vs reference:")
+for m, v in ref.items():
+    calc = ndr_df.loc[ndr_df["MONTH"] == m, "NDR"].values[0]
+    print(f"  Month {m:2d}: calc={calc:.2%}  ref={v:.2%}  diff={abs(calc-v):.2%}")
+
+# ─────────────────────────────────────────────
+# SECTION 3 – H1: Brand Diversity
+# ─────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("SECTION 3: H1 – First-Month Brand Diversity")
+print("=" * 60)
+
+month0_orders = orders_m[orders_m["MONTH_OFFSET"] == 0]
+brand_diversity = (
+    month0_orders.groupby("RETAILER_ID")["BRAND_ID"]
+    .nunique()
+    .reset_index()
+    .rename(columns={"BRAND_ID": "UNIQUE_BRANDS_M0"})
+)
+
+def bucket_brands(n):
+    if n == 1:   return "1"
+    if n == 2:   return "2"
+    if n <= 5:   return "3-5"
+    return "6+"
+
+brand_diversity["BRAND_BUCKET"] = brand_diversity["UNIQUE_BRANDS_M0"].apply(bucket_brands)
+
+# Retention: any order in month 6+ or 12+
+has_m6plus  = monthly_gmv[(monthly_gmv["MONTH_OFFSET"] >= 6)  & (monthly_gmv["GMV"] > 0)]["RETAILER_ID"].unique()
+has_m12plus = monthly_gmv[(monthly_gmv["MONTH_OFFSET"] >= 12) & (monthly_gmv["GMV"] > 0)]["RETAILER_ID"].unique()
+
+brand_diversity["RET_6MO"]  = brand_diversity["RETAILER_ID"].isin(has_m6plus).astype(int)
+brand_diversity["RET_12MO"] = brand_diversity["RETAILER_ID"].isin(has_m12plus).astype(int)
+
+bucket_order = ["1", "2", "3-5", "6+"]
+h1_table = (
+    brand_diversity.groupby("BRAND_BUCKET")
+    .agg(COUNT=("RETAILER_ID", "count"),
+         RET_6MO=("RET_6MO", "mean"),
+         RET_12MO=("RET_12MO", "mean"))
+    .reindex(bucket_order)
+    .reset_index()
+)
+h1_table["RET_6MO"]  = (h1_table["RET_6MO"]  * 100).round(1)
+h1_table["RET_12MO"] = (h1_table["RET_12MO"] * 100).round(1)
+print(h1_table.to_string(index=False))
+
+fig, ax = plt.subplots(figsize=(8, 5))
+x = np.arange(len(bucket_order))
+w = 0.35
+bars1 = ax.bar(x - w/2, h1_table["RET_6MO"],  w, label="6-Mo Retention %",  color="#4C72B0")
+bars2 = ax.bar(x + w/2, h1_table["RET_12MO"], w, label="12-Mo Retention %", color="#DD8452")
+ax.set_xticks(x)
+ax.set_xticklabels(bucket_order)
+ax.set_xlabel("Unique Brands in Month 0")
+ax.set_ylabel("Retention Rate (%)")
+ax.set_title("H1: Brand Diversity in Month 0 vs Retention")
+ax.legend()
+ax.set_ylim(0, 100)
+for bar in bars1:
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1, f"{bar.get_height():.1f}%", ha="center", va="bottom", fontsize=9)
+for bar in bars2:
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1, f"{bar.get_height():.1f}%", ha="center", va="bottom", fontsize=9)
+plt.tight_layout()
+plt.savefig("charts/h1_brand_diversity.png", dpi=150)
+plt.close()
+print("Saved: charts/h1_brand_diversity.png")
+
+# ─────────────────────────────────────────────
+# SECTION 4 – H2: Early Repeat Purchasing
+# ─────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("SECTION 4: H2 – Early Repeat Purchasing")
+print("=" * 60)
+
+first3_active = (
+    monthly_gmv[(monthly_gmv["MONTH_OFFSET"].isin([0, 1, 2])) & (monthly_gmv["GMV"] > 0)]
+    .groupby("RETAILER_ID")["MONTH_OFFSET"]
+    .nunique()
+    .reset_index()
+    .rename(columns={"MONTH_OFFSET": "ACTIVE_MONTHS_FIRST3"})
+)
+# Retailers only in month 0 data: those not in orders at all for m1/m2 get 1
+all_ret_df = retailers[["RETAILER_ID"]].copy()
+first3_active = all_ret_df.merge(first3_active, on="RETAILER_ID", how="left")
+first3_active["ACTIVE_MONTHS_FIRST3"] = first3_active["ACTIVE_MONTHS_FIRST3"].fillna(0).astype(int)
+# Clamp: retailers who never even appear in orders_m get 0; those with m0 only = 1
+# Make sure month0 retailers who have no orders at all are counted as 0
+# (If a retailer is in the retailers file but has no orders, they have 0 active months)
+
+first3_active["RET_12MO"] = first3_active["RETAILER_ID"].isin(has_m12plus).astype(int)
+
+h2_table = (
+    first3_active.groupby("ACTIVE_MONTHS_FIRST3")
+    .agg(COUNT=("RETAILER_ID", "count"),
+         RET_12MO=("RET_12MO", "mean"))
+    .reset_index()
+)
+h2_table["RET_12MO_PCT"] = (h2_table["RET_12MO"] * 100).round(1)
+h2_table.columns = ["Active Months (of first 3)", "Count", "RET_12MO", "12-Mo Retention %"]
+print(h2_table[["Active Months (of first 3)", "Count", "12-Mo Retention %"]].to_string(index=False))
+
+fig, ax = plt.subplots(figsize=(7, 5))
+bars = ax.bar(
+    h2_table["Active Months (of first 3)"].astype(str),
+    h2_table["12-Mo Retention %"],
+    color=["#4C72B0", "#55A868", "#C44E52", "#8172B2"][:len(h2_table)]
+)
+ax.set_xlabel("Active Months in First 3 Months")
+ax.set_ylabel("12-Mo Retention Rate (%)")
+ax.set_title("H2: Early Repeat Purchasing vs 12-Mo Retention")
+ax.set_ylim(0, 100)
+for bar in bars:
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1, f"{bar.get_height():.1f}%", ha="center", va="bottom", fontsize=10)
+plt.tight_layout()
+plt.savefig("charts/h2_early_repeat.png", dpi=150)
+plt.close()
+print("Saved: charts/h2_early_repeat.png")
+
+# ─────────────────────────────────────────────
+# SECTION 5 – H3: App Install & Causality
+# ─────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("SECTION 5: H3 – App Install & Reverse Causality")
+print("=" * 60)
+
+ret_base = retailers[["RETAILER_ID", "FLAG_APP_INSTALLED",
+                        "FIRST_APP_SESSION_AT", "FIRST_CONFIRMED_ORDER_PLACED_AT"]].copy()
+ret_base["RET_12MO"] = ret_base["RETAILER_ID"].isin(has_m12plus).astype(int)
+
+# Basic retention by app install flag
+app_ret = (
+    ret_base.groupby("FLAG_APP_INSTALLED")["RET_12MO"]
+    .agg(COUNT="count", RET_12MO_PCT=lambda x: (x.mean() * 100).round(1))
+    .reset_index()
+)
+print("\n12-Mo Retention by App Installed flag:")
+print(app_ret.to_string(index=False))
+
+# Days from first order to first app session
+ret_base["DAYS_TO_APP"] = (
+    ret_base["FIRST_APP_SESSION_AT"] - ret_base["FIRST_CONFIRMED_ORDER_PLACED_AT"]
+).dt.days
+
+def app_timing_bucket(row):
+    if pd.isnull(row["FIRST_APP_SESSION_AT"]):
+        return "Never installed"
+    d = row["DAYS_TO_APP"]
+    if d < 0:
+        return "Before first order"
+    if d <= 30:
+        return "Within 30 days"
+    if d <= 180:
+        return "31-180 days"
+    return "180+ days"
+
+ret_base["APP_TIMING"] = ret_base.apply(app_timing_bucket, axis=1)
+
+timing_counts = ret_base["APP_TIMING"].value_counts()
+timing_pct    = (timing_counts / len(ret_base) * 100).round(1)
+print("\nApp install timing distribution:")
+print(pd.DataFrame({"Count": timing_counts, "Pct %": timing_pct}))
+
+timing_order = ["Before first order", "Within 30 days", "31-180 days", "180+ days", "Never installed"]
+h3_table = (
+    ret_base.groupby("APP_TIMING")["RET_12MO"]
+    .agg(COUNT="count", RET_12MO=lambda x: (x.mean() * 100).round(1))
+    .reindex(timing_order)
+    .reset_index()
+)
+print("\n12-Mo Retention by App Timing:")
+print(h3_table.to_string(index=False))
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+# Left: timing distribution pie
+present_order = [t for t in timing_order if t in timing_counts.index]
+axes[0].pie(
+    timing_counts[present_order],
+    labels=present_order,
+    autopct="%1.1f%%",
+    startangle=90,
+    colors=sns.color_palette("Set2", len(present_order))
+)
+axes[0].set_title("App Install Timing Distribution")
+
+# Right: 12-mo retention by timing
+h3_plot = h3_table.dropna(subset=["RET_12MO"])
+bars = axes[1].bar(
+    range(len(h3_plot)),
+    h3_plot["RET_12MO"],
+    color=sns.color_palette("Set2", len(h3_plot))
+)
+axes[1].set_xticks(range(len(h3_plot)))
+axes[1].set_xticklabels(h3_plot["APP_TIMING"], rotation=20, ha="right", fontsize=9)
+axes[1].set_ylabel("12-Mo Retention Rate (%)")
+axes[1].set_title("12-Mo Retention by App Install Timing")
+axes[1].set_ylim(0, 100)
+for bar in bars:
+    axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                 f"{bar.get_height():.1f}%", ha="center", va="bottom", fontsize=9)
+plt.tight_layout()
+plt.savefig("charts/h3_app_install.png", dpi=150)
+plt.close()
+print("Saved: charts/h3_app_install.png")
+
+# ─────────────────────────────────────────────
+# SECTION 6 – Payment Terms Analysis
+# ─────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("SECTION 6: Payment Terms Analysis")
+print("=" * 60)
+
+# Lifetime GMV per retailer
+lifetime_gmv = (
+    orders_m.groupby("RETAILER_ID")["TOTAL_GMV"].sum()
+    .reset_index().rename(columns={"TOTAL_GMV": "LIFETIME_GMV"})
+)
+# Months active
+months_active = (
+    monthly_gmv[monthly_gmv["GMV"] > 0]
+    .groupby("RETAILER_ID")["MONTH_OFFSET"].nunique()
+    .reset_index().rename(columns={"MONTH_OFFSET": "MONTHS_ACTIVE"})
+)
+
+ret_pay = retailers[["RETAILER_ID", "PAYMENT_TERM", "FLAG_APP_INSTALLED"]].merge(
+    lifetime_gmv, on="RETAILER_ID", how="left"
+).merge(
+    months_active, on="RETAILER_ID", how="left"
+)
+ret_pay["MONTHS_ACTIVE"]  = ret_pay["MONTHS_ACTIVE"].fillna(0)
+ret_pay["LIFETIME_GMV"]   = ret_pay["LIFETIME_GMV"].fillna(0)
+ret_pay["RET_6MO"]        = ret_pay["RETAILER_ID"].isin(has_m6plus).astype(int)
+ret_pay["RET_12MO"]       = ret_pay["RETAILER_ID"].isin(has_m12plus).astype(int)
+
+# Single-month churn: only active in month 0, never again
+has_post_m0 = monthly_gmv[(monthly_gmv["MONTH_OFFSET"] > 0) & (monthly_gmv["GMV"] > 0)]["RETAILER_ID"].unique()
+ret_pay["SINGLE_MONTH_CHURN"] = (~ret_pay["RETAILER_ID"].isin(has_post_m0)).astype(int)
+
+pay_table = (
+    ret_pay.groupby("PAYMENT_TERM")
+    .agg(COUNT=("RETAILER_ID", "count"),
+         AVG_LIFETIME_GMV=("LIFETIME_GMV", "mean"),
+         AVG_MONTHS_ACTIVE=("MONTHS_ACTIVE", "mean"),
+         SINGLE_MONTH_CHURN_RATE=("SINGLE_MONTH_CHURN", "mean"),
+         RET_6MO=("RET_6MO", "mean"))
+    .reset_index()
+)
+pay_table["AVG_LIFETIME_GMV"]        = pay_table["AVG_LIFETIME_GMV"].round(0)
+pay_table["AVG_MONTHS_ACTIVE"]       = pay_table["AVG_MONTHS_ACTIVE"].round(2)
+pay_table["SINGLE_MONTH_CHURN_RATE"] = (pay_table["SINGLE_MONTH_CHURN_RATE"] * 100).round(1)
+pay_table["RET_6MO"]                 = (pay_table["RET_6MO"] * 100).round(1)
+print("\nRetention Metrics by Payment Term:")
+print(pay_table.to_string(index=False))
+
+# Cross-tab: 6-mo retention by FLAG_APP_INSTALLED x PAYMENT_TERM
+cross = ret_pay.pivot_table(
+    values="RET_6MO", index="FLAG_APP_INSTALLED",
+    columns="PAYMENT_TERM", aggfunc="mean"
+) * 100
+cross = cross.round(1)
+print("\n6-Mo Retention % — App Installed x Payment Term:")
+print(cross)
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+# Left: bar chart – 6-mo retention by payment term
+pay_terms = pay_table["PAYMENT_TERM"].tolist()
+bars = axes[0].bar(pay_terms, pay_table["RET_6MO"], color=["#4C72B0", "#DD8452"])
+axes[0].set_ylabel("6-Mo Retention Rate (%)")
+axes[0].set_title("6-Mo Retention by Payment Term")
+axes[0].set_ylim(0, 100)
+for bar in bars:
+    axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                 f"{bar.get_height():.1f}%", ha="center", va="bottom", fontsize=11)
+
+# Right: heatmap cross-tab
+sns.heatmap(cross, annot=True, fmt=".1f", cmap="YlGnBu", ax=axes[1], vmin=0, vmax=100,
+            linewidths=0.5, cbar_kws={"label": "6-Mo Retention %"})
+axes[1].set_title("6-Mo Retention %: App Installed x Payment Term")
+axes[1].set_xlabel("Payment Term")
+axes[1].set_ylabel("App Installed")
+plt.tight_layout()
+plt.savefig("charts/h4_payment_terms.png", dpi=150)
+plt.close()
+print("Saved: charts/h4_payment_terms.png")
+
+# ─────────────────────────────────────────────
+# SECTION 7 – Unknown Segment Deep Dive
+# ─────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("SECTION 7: Unknown ANNUAL_SALES_BUCKET Deep Dive")
+print("=" * 60)
+
+ret_full = retailers.merge(lifetime_gmv, on="RETAILER_ID", how="left")\
+                    .merge(months_active, on="RETAILER_ID", how="left")
+ret_full["MONTHS_ACTIVE"]  = ret_full["MONTHS_ACTIVE"].fillna(0)
+ret_full["LIFETIME_GMV"]   = ret_full["LIFETIME_GMV"].fillna(0)
+ret_full["RET_12MO"]       = ret_full["RETAILER_ID"].isin(has_m12plus).astype(int)
+ret_full["RET_6MO"]        = ret_full["RETAILER_ID"].isin(has_m6plus).astype(int)
+ret_full["SINGLE_MONTH_CHURN"] = (~ret_full["RETAILER_ID"].isin(has_post_m0)).astype(int)
+ret_full["SEGMENT"] = ret_full["ANNUAL_SALES_BUCKET"].apply(
+    lambda x: "Unknown" if x == "Unknown" else "Known"
+)
+
+seg_table = (
+    ret_full.groupby("SEGMENT")
+    .agg(COUNT=("RETAILER_ID", "count"),
+         RET_12MO=("RET_12MO", "mean"),
+         AVG_LIFETIME_GMV=("LIFETIME_GMV", "mean"),
+         SINGLE_MONTH_CHURN=("SINGLE_MONTH_CHURN", "mean"),
+         RET_6MO=("RET_6MO", "mean"))
+    .reset_index()
+)
+seg_table["RET_12MO"]        = (seg_table["RET_12MO"] * 100).round(1)
+seg_table["AVG_LIFETIME_GMV"] = seg_table["AVG_LIFETIME_GMV"].round(0)
+seg_table["SINGLE_MONTH_CHURN"] = (seg_table["SINGLE_MONTH_CHURN"] * 100).round(1)
+seg_table["RET_6MO"]         = (seg_table["RET_6MO"] * 100).round(1)
+print("\nUnknown vs Known Segments – Core Metrics:")
+print(seg_table.to_string(index=False))
+
+# Payment term distribution
+pay_dist = (
+    ret_full.groupby(["SEGMENT", "PAYMENT_TERM"])["RETAILER_ID"]
+    .count().unstack(fill_value=0)
+)
+pay_dist_pct = pay_dist.div(pay_dist.sum(axis=1), axis=0) * 100
+print("\nPayment Term Distribution (%):")
+print(pay_dist_pct.round(1))
+
+# Business type distribution
+biz_dist = (
+    ret_full.groupby(["SEGMENT", "RETAILER_BUSINESS_TYPE"])["RETAILER_ID"]
+    .count().unstack(fill_value=0)
+)
+biz_dist_pct = biz_dist.div(biz_dist.sum(axis=1), axis=0) * 100
+print("\nBusiness Type Distribution (%):")
+print(biz_dist_pct.round(1))
+
+# Within Unknown: 12-mo retention by ANNUAL_SALES_BUCKET breakdown
+unk_detail = (
+    ret_full[ret_full["ANNUAL_SALES_BUCKET"] != "Unknown"]
+    .groupby("ANNUAL_SALES_BUCKET")
+    .agg(COUNT=("RETAILER_ID", "count"),
+         RET_12MO=("RET_12MO", "mean"))
+    .reset_index()
+)
+unk_detail["RET_12MO"] = (unk_detail["RET_12MO"] * 100).round(1)
+print("\nKnown ANNUAL_SALES_BUCKET – 12-Mo Retention:")
+print(unk_detail.to_string(index=False))
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+# Left: 12-mo retention comparison
+segments = seg_table["SEGMENT"].tolist()
+ret_vals = seg_table["RET_12MO"].tolist()
+bars = axes[0].bar(segments, ret_vals, color=["#4C72B0", "#C44E52"])
+axes[0].set_ylabel("12-Mo Retention Rate (%)")
+axes[0].set_title("12-Mo Retention: Known vs Unknown Segment")
+axes[0].set_ylim(0, 100)
+for bar in bars:
+    axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                 f"{bar.get_height():.1f}%", ha="center", va="bottom", fontsize=11)
+
+# Right: avg lifetime GMV
+gmv_vals = seg_table["AVG_LIFETIME_GMV"].tolist()
+bars2 = axes[1].bar(segments, gmv_vals, color=["#4C72B0", "#C44E52"])
+axes[1].set_ylabel("Avg Lifetime GMV ($)")
+axes[1].set_title("Avg Lifetime GMV: Known vs Unknown Segment")
+for bar in bars2:
+    axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + bar.get_height()*0.02,
+                 f"${bar.get_height():,.0f}", ha="center", va="bottom", fontsize=11)
+plt.tight_layout()
+plt.savefig("charts/h5_unknown_segment.png", dpi=150)
+plt.close()
+print("Saved: charts/h5_unknown_segment.png")
+
+# ─────────────────────────────────────────────
+# SECTION 8 – Summary Visualization (2x3 grid)
+# ─────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("SECTION 8: Summary Visualization")
+print("=" * 60)
+
+fig = plt.figure(figsize=(18, 11))
+gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.35)
+
+# ── Panel 1: NDR curve (top-left) ──────────────────────────
+ax1 = fig.add_subplot(gs[0, 0])
+ax1.plot(ndr_df["MONTH"], ndr_df["NDR"] * 100, marker="o", color="#4C72B0", linewidth=2)
+ref_months = list(ref.keys())
+ref_vals   = [ref[m] * 100 for m in ref_months]
+ax1.scatter(ref_months, ref_vals, color="red", zorder=5, label="Reference", s=60)
+ax1.set_xlabel("Month (0 = cohort entry)")
+ax1.set_ylabel("NDR (%)")
+ax1.set_title("NDR Curve (Months 0–17)")
+ax1.legend(fontsize=8)
+ax1.set_ylim(0, 120)
+ax1.axhline(100, color="gray", linestyle="--", linewidth=0.8)
+
+# ── Panel 2: H1 Brand Diversity (top-middle) ───────────────
+ax2 = fig.add_subplot(gs[0, 1])
+x   = np.arange(len(bucket_order))
+w   = 0.35
+ax2.bar(x - w/2, h1_table["RET_6MO"],  w, label="6-Mo",  color="#4C72B0")
+ax2.bar(x + w/2, h1_table["RET_12MO"], w, label="12-Mo", color="#DD8452")
+ax2.set_xticks(x)
+ax2.set_xticklabels(bucket_order)
+ax2.set_xlabel("Brands in Month 0")
+ax2.set_ylabel("Retention (%)")
+ax2.set_title("H1: Brand Diversity → Retention")
+ax2.legend(fontsize=8)
+ax2.set_ylim(0, 100)
+
+# ── Panel 3: H2 Early Repeat (top-right) ───────────────────
+ax3 = fig.add_subplot(gs[0, 2])
+h2_plot = h2_table[h2_table["Active Months (of first 3)"] > 0].copy()
+ax3.bar(h2_plot["Active Months (of first 3)"].astype(str),
+        h2_plot["12-Mo Retention %"],
+        color=["#55A868", "#4C72B0", "#C44E52"])
+ax3.set_xlabel("Active Months in First 3")
+ax3.set_ylabel("12-Mo Retention (%)")
+ax3.set_title("H2: Early Repeat → 12-Mo Retention")
+ax3.set_ylim(0, 100)
+
+# ── Panel 4: H3 App Install Timing (bottom-left) ───────────
+ax4 = fig.add_subplot(gs[1, 0])
+h3_clean = h3_table.dropna(subset=["RET_12MO"])
+colors4  = sns.color_palette("Set2", len(h3_clean))
+ax4.bar(range(len(h3_clean)), h3_clean["RET_12MO"], color=colors4)
+ax4.set_xticks(range(len(h3_clean)))
+ax4.set_xticklabels(h3_clean["APP_TIMING"], rotation=15, ha="right", fontsize=7)
+ax4.set_ylabel("12-Mo Retention (%)")
+ax4.set_title("H3: App Install Timing → Retention")
+ax4.set_ylim(0, 100)
+
+# ── Panel 5: Payment Term (bottom-middle) ──────────────────
+ax5 = fig.add_subplot(gs[1, 1])
+sns.heatmap(cross, annot=True, fmt=".1f", cmap="YlGnBu", ax=ax5,
+            vmin=0, vmax=100, linewidths=0.5,
+            cbar_kws={"label": "6-Mo Ret %", "shrink": 0.8})
+ax5.set_title("H4: App x Payment Term → 6-Mo Ret %")
+ax5.set_xlabel("Payment Term")
+ax5.set_ylabel("App Installed")
+
+# ── Panel 6: Unknown Segment (bottom-right) ────────────────
+ax6 = fig.add_subplot(gs[1, 2])
+metrics = ["RET_6MO", "RET_12MO", "SINGLE_MONTH_CHURN"]
+metric_labels = ["6-Mo Ret%", "12-Mo Ret%", "Churn %"]
+x6 = np.arange(len(metrics))
+w6 = 0.35
+known_vals   = seg_table[seg_table["SEGMENT"] == "Known"][metrics].values[0]
+unknown_vals = seg_table[seg_table["SEGMENT"] == "Unknown"][metrics].values[0]
+ax6.bar(x6 - w6/2, known_vals,   w6, label="Known",   color="#4C72B0")
+ax6.bar(x6 + w6/2, unknown_vals, w6, label="Unknown", color="#C44E52")
+ax6.set_xticks(x6)
+ax6.set_xticklabels(metric_labels)
+ax6.set_ylabel("Rate (%)")
+ax6.set_title("H5: Unknown vs Known Segment")
+ax6.legend(fontsize=8)
+ax6.set_ylim(0, 100)
+
+fig.suptitle("Faire Retailer Retention Analysis — Summary Dashboard", fontsize=14, fontweight="bold", y=1.01)
+plt.savefig("charts/summary.png", dpi=150, bbox_inches="tight")
+plt.close()
+print("Saved: charts/summary.png")
+
+print("\n" + "=" * 60)
+print("ALL SECTIONS COMPLETE")
+print("=" * 60)
